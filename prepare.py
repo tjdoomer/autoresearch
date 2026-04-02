@@ -293,14 +293,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
+    # CPU-only buffer: pack rows, yield numpy slices (MLX ingests these zero-copy)
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
 
     while True:
         for row_idx in range(B):
@@ -331,16 +325,13 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+        # Yield numpy slices — mx.array() ingests these zero-copy on CPU-resident data
+        yield row_buffer[:, :-1].numpy(), row_buffer[:, 1:].numpy(), epoch
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
 def evaluate_bpb(model, tokenizer, batch_size):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
@@ -348,20 +339,40 @@ def evaluate_bpb(model, tokenizer, batch_size):
     then converts nats/byte to bits/byte. Special tokens (byte length 0)
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+
+    Accepts an MLX model: inputs/targets are converted numpy→MLX arrays,
+    and the per-token loss output is converted back to numpy for the
+    byte-length masking and summation.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    import mlx.core as mx
+    import numpy as np
+
+    # token_bytes: CPU torch tensor [vocab_size] — convert to numpy for indexing
+    token_bytes_np = get_token_bytes().numpy()
+
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
+
     for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
+        x_np, y_np, _ = next(val_loader)           # numpy [B, T]
+        x = mx.array(x_np)
+        y = mx.array(y_np)
+
+        # model returns per-token losses as MLX array of shape [B, T] or [B*T]
+        loss_flat = model(x, y, reduction='none')
+        loss_flat = loss_flat.reshape(-1)            # [B*T]
+        mx.eval(loss_flat)                           # force before numpy conversion
+
+        y_flat = y_np.reshape(-1)                    # numpy [B*T]
+        nbytes = token_bytes_np[y_flat]              # numpy [B*T], byte len per token
+        mask = nbytes > 0                            # exclude special tokens (0 bytes)
+
+        loss_np = np.array(loss_flat)                # MLX → numpy
+        total_nats  += float((loss_np * mask).sum())
+        total_bytes += int(nbytes.sum())
+
     return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------
