@@ -16,7 +16,7 @@ from dataclasses import dataclass, asdict
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -340,6 +340,30 @@ POLAR_EXPRESS_COEFFS = [
 ]
 
 
+def _set_nested(obj, parts, value):
+    """
+    Walk a dotted path and set the leaf value directly on the model.
+
+    Digit path segments (e.g. '0', '1') are treated as:
+    - integer indices when the parent is a list  (self.h = [Block, Block, ...])
+    - string keys     when the parent is a dict  (self.value_embeds = {'0': Emb, ...})
+    This avoids the tree_unflatten list-vs-dict ambiguity.
+    """
+    for part in parts[:-1]:
+        if part.isdigit():
+            obj = obj[int(part)] if isinstance(obj, (list, tuple)) else obj[part]
+        else:
+            obj = getattr(obj, part)
+    leaf = parts[-1]
+    if leaf.isdigit():
+        if isinstance(obj, (list, tuple)):
+            obj[int(leaf)] = value
+        else:
+            obj[leaf] = value   # dict with string keys (e.g. value_embeds)
+    else:
+        setattr(obj, leaf, value)
+
+
 def _orthogonalize(G, ns_steps):
     """
     Approximate polar decomposition via Newton-Schulz iterations.
@@ -507,10 +531,13 @@ class MuonAdamW:
         mask  = ((g * param) >= 0).astype(g.dtype)
         return param - lr * g - lr * wd * param * mask
 
-    def update(self, model, grads):
-        """Apply one optimizer step. Call mx.eval() after this."""
+    def update(self, model, flat_grads):
+        """
+        Apply one optimizer step. flat_grads is a {dotted_path: mx.array} dict
+        (already flattened — avoids tree_unflatten list-vs-dict ambiguity).
+        Call mx.eval() after this.
+        """
         flat_params = dict(tree_flatten(model.trainable_parameters()))
-        flat_grads  = dict(tree_flatten(grads))
 
         # Classify on first call (shapes are stable after init)
         if self._muon_paths is None:
@@ -526,8 +553,11 @@ class MuonAdamW:
             else:
                 updated[path] = self._adamw_step(path, param, grad)
 
-        # Apply all updates to model parameters in bulk
-        model.update(tree_unflatten(list(updated.items())))
+        # Apply updates directly via path traversal — avoids tree_unflatten's
+        # list-vs-dict ambiguity (e.g. value_embeds keys '0','1' are string
+        # but unflatten would reconstruct them as a list, breaking model.update)
+        for path, new_val in updated.items():
+            _set_nested(model, path.split('.'), new_val)
 
     def set_lr_multiplier(self, lrm):
         """Scale all learning rates by lrm relative to their initial values."""
@@ -567,7 +597,7 @@ FINAL_LR_FRAC     = 0.0    # final LR as fraction of initial
 DEPTH             = 8      # number of transformer layers
 # Reduced from 128 (H100) — Apple Silicon has less compute throughput than H100
 # despite having more unified memory. Increase if runs are stable.
-DEVICE_BATCH_SIZE = 32
+DEVICE_BATCH_SIZE = 16
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -691,6 +721,10 @@ while True:
         x = mx.array(x_np)
         y = mx.array(y_np)
         loss, grads = loss_and_grad_fn(model, x, y)
+        # Evaluate each micro-step immediately — prevents MLX from building a
+        # giant deferred computation graph across all accumulation steps, which
+        # would exhaust unified memory before any Metal work begins.
+        mx.eval(loss, grads)
         accumulated_loss = accumulated_loss + loss / grad_accum_steps
         flat_g = dict(tree_flatten(grads))
         if accumulated_grads is None:
@@ -711,7 +745,7 @@ while True:
     optimizer.set_muon_weight_decay(muon_weight_decay)
 
     # --- Optimizer step ---
-    optimizer.update(model, tree_unflatten(list(accumulated_grads.items())))
+    optimizer.update(model, accumulated_grads)   # already a flat {path: grad} dict
 
     # --- Synchronise: force execution of the entire lazy computation graph ---
     # This is where Metal GPU work actually happens.
